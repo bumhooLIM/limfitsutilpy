@@ -71,17 +71,17 @@ class Lv0:
         hdr['BUNIT']        = ('adu', 'array data unit')
 
         # --- Telescope & Site
-        for key, unit, comment in [
-            ('RA',  'hourangle', 'Telescope RA (deg)'),
-            ('DEC', 'degree',    'Telescope Dec (deg)'),
-            ('ALT', 'degree',    'Telescope Alt (deg)'),
-            ('AZ',  'degree',    'Telescope Az (deg)'),
-        ]:
-            if isinstance(hdr.get(key), str):
-                hdr[key] = (Angle(hdr[key], unit=unit).degree, comment)
-        hdr['LON']   = (-119.4, 'Site Longitude (deg)')
-        hdr['LAT']   = ( 37.07, 'Site Latitude (deg)')
-        hdr['ELEV']  = (  1.405,'Site Elevation (km)')
+        # for key, unit, comment in [
+        #     ('RA',  'hourangle', 'Telescope RA (deg)'),
+        #     ('DEC', 'degree',    'Telescope Dec (deg)'),
+        #     ('ALT', 'degree',    'Telescope Alt (deg)'),
+        #     ('AZ',  'degree',    'Telescope Az (deg)'),
+        # ]:
+        #     if isinstance(hdr.get(key), str):
+        #         hdr[key] = (Angle(hdr[key], unit=unit).degree, comment)
+        # hdr['LON']   = (-119.4, 'Site Longitude (deg)')
+        # hdr['LAT']   = ( 37.07, 'Site Latitude (deg)')
+        # hdr['ELEV']  = (  1.405,'Site Elevation (km)')
 
         # --- Processing flags
         for flag in ['BIASCORR', 'DARKCORR', 'FLATCORR']:

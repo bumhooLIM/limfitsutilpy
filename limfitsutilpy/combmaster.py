@@ -54,23 +54,23 @@ class CombMaster:
 
         Returns
         -------
-        list[CCDData]
-            A list of loaded CCDData objects. Frames that fail to load
+        list[tuple(CCDData, Path)]
+            A list of (CCDData, Path) tuples. Frames that fail to load
             are logged and skipped.
         """
-        ccd_list = []
+        ccd_list_with_paths = []
         if not file_list:
-            return ccd_list
+            return ccd_list_with_paths
             
         self.logger.info(f"Loading {len(file_list)} frames...")
         for fpath in file_list:
             fpath = Path(fpath)
             try:
                 ccd = CCDData.read(fpath, unit="adu")
-                ccd_list.append(ccd)
+                ccd_list_with_paths.append((ccd, fpath))
             except Exception as e:
                 self.logger.error(f"Failed to load {fpath.name}: {e}")
-        return ccd_list
+        return ccd_list_with_paths
 
     def _find_closest_bias(self, master_dir, target_jd):
         """
@@ -226,12 +226,15 @@ class CombMaster:
         master_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Load data from fits files into CCDData objects
-        bias_ccds = self._load_ccd_list(bias_frames)
-        if not bias_ccds:
+        bias_ccds_with_paths = self._load_ccd_list(bias_frames)
+        if not bias_ccds_with_paths:
             self.logger.error("No bias frames loaded. Aborting comb_master_bias.")
             return None
-
+        
+        # Extract CCDs for combination
+        bias_ccds = [ccd for ccd, fpath in bias_ccds_with_paths]
         hdr0 = bias_ccds[0].header # load first header for metadata
+
         obsdate = hdr0.get('OBSDATE', Time(hdr0['JD'], format='jd').to_datetime().strftime('%Y%m%d'))
         fpath_mbias = master_dir / f"{outname}.bias.comb.{obsdate}.fits"
 
@@ -297,13 +300,13 @@ class CombMaster:
         master_dir = Path(master_dir)
             
         # 1. Load all dark frames
-        dark_ccds = self._load_ccd_list(dark_frames)
-        if not dark_ccds:
+        dark_ccds_with_paths = self._load_ccd_list(dark_frames)
+        if not dark_ccds_with_paths:
             self.logger.error("No dark frames loaded. Aborting comb_master_dark.")
             return []
         
         # 2. Find closest master bias
-        hdr0 = dark_ccds[0].header
+        hdr0 = dark_ccds_with_paths[0][0].header # Get header from first CCD
         obs_jd = hdr0['JD']
         mbias, bias_path = self._find_closest_bias(master_dir, obs_jd)
         
@@ -316,7 +319,7 @@ class CombMaster:
         
         # 3. Group darks by exposure time and subtract bias
         grouped_darks = {}
-        for ccd in dark_ccds:
+        for ccd, fpath in dark_ccds_with_paths:
             try:
                 # Check exptime key
                 if key_exptime.upper() in ccd.header:
@@ -324,7 +327,7 @@ class CombMaster:
                 elif key_exptime.lower() in ccd.header:
                     exptime = float(ccd.header[key_exptime.lower()])
                 else:
-                    self.logger.warning(f"Cannot find key {key_exptime} in {ccd.meta['FILENAME']}. Skipping.")
+                    self.logger.warning(f"Cannot find key {key_exptime} in {fpath.name}. Skipping.")
                     continue
                 
                 bdark = ccdproc.subtract_bias(ccd, mbias)
@@ -333,7 +336,7 @@ class CombMaster:
                     grouped_darks[exptime] = []
                 grouped_darks[exptime].append(bdark)
             except Exception as e:
-                self.logger.error(f"Failed to bias-subtract {ccd.meta.get('FILENAME', 'unknown file')}: {e}")
+                self.logger.error(f"Failed to bias-subtract {fpath.name}: {e}")
 
         # 4. Combine groups and save
         mdark_frames = []
@@ -412,12 +415,12 @@ class CombMaster:
         master_dir = Path(master_dir)
         
         # 1. Load flats
-        flat_ccds = self._load_ccd_list(flat_frames)
-        if not flat_ccds:
+        flat_ccds_with_paths = self._load_ccd_list(flat_frames)
+        if not flat_ccds_with_paths:
             self.logger.error("No flat frames loaded. Aborting comb_master_flat.")
             return None
             
-        hdr0_flat = flat_ccds[0].header
+        hdr0_flat = flat_ccds_with_paths[0][0].header # Get header from first CCD
         obs_jd = hdr0_flat['JD']
 
         # 2. Load Master Bias
@@ -429,7 +432,7 @@ class CombMaster:
         
         # 3. Process flats (bias and dark subtraction)
         processed_flats = []
-        for ccd in flat_ccds:
+        for ccd, fpath in flat_ccds_with_paths:
             try:
                 bflat = ccdproc.subtract_bias(ccd, mbias)
                 bflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {bias_path.name}"
@@ -440,7 +443,7 @@ class CombMaster:
                 elif key_exptime.lower() in ccd.header:
                     exptime = float(ccd.header[key_exptime.lower()])
                 else:
-                    self.logger.warning(f"Cannot find key {key_exptime} in {ccd.meta.get('FILENAME', 'unknown file')}. Skipping dark subtraction.")
+                    self.logger.warning(f"Cannot find key {key_exptime} in {fpath.name}. Skipping dark subtraction.")
                     processed_flats.append(bflat)
                     continue
 
@@ -449,18 +452,18 @@ class CombMaster:
 
                 if mdark is None:
                     # No dark found (or no darks exist). Log it and append the bias-subtracted flat.
-                    self.logger.warning(f"No matching master dark found for flat {ccd.meta.get('FILENAME', 'unknown file')} (JD={ccd.header['JD']}, Exp={exptime}s). Proceeding without dark subtraction.")
+                    self.logger.warning(f"No matching master dark found for flat {fpath.name} (JD={ccd.header['JD']}, Exp={exptime}s). Proceeding without dark subtraction.")
                     processed_flats.append(bflat)
                     continue # Skip to the next flat
 
                 # Dark was found, proceed with subtraction
-                self.logger.info(f"Using master dark: {dark_path.name} for flat {ccd.meta.get('FILENAME', 'unknown file')}")
+                self.logger.info(f"Using master dark: {dark_path.name} for flat {fpath.name}")
                 bdflat = ccdproc.subtract_dark(bflat, mdark, exposure_time=key_exptime, exposure_unit=u.second)
                 bdflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master dark subtracted: {dark_path.name}"
                 processed_flats.append(bdflat)
                 
             except Exception as e:
-                self.logger.error(f"Failed to process flat {ccd.meta.get('FILENAME', 'unknown file')}: {e}")
+                self.logger.error(f"Failed to process flat {fpath.name}: {e}")
 
         # 4. Combine processed flats
         if not processed_flats:
