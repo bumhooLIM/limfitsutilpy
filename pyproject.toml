@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "limfitsutilpy"
+version = "0.1.0"
+description = "Astronomy convinient tools"
+authors = [{ name = "Bumhoo Lim", email = "bumhoo7@snu.ac.kr" }]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+# Keep dependencies empty while you sort packaging; you can add later.
+dependencies = [
+    "astropy",
+    "numpy",
+    "ccdproc",
+    "astrometry",
+    "sep",
+    "matplotlib",
+    "astroalign",
+    "photutils"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["notebooks*", "tests*"]
