@@ -1,10 +1,7 @@
 import bz2
-import io
 import shutil
 from pathlib import Path
-from astropy.io import fits
-from typing import List
-from tqdm import tqdm # Progress bar
+from tqdm import tqdm
 import logging
 
 # Set up module-level logger

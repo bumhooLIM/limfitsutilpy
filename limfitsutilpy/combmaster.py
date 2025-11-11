@@ -3,21 +3,19 @@ from pathlib import Path
 from astropy.io import fits
 from astropy.time import Time
 from astropy.wcs import FITSFixedWarning
-import astropy.units as u
 from astropy.nddata import CCDData
 from astropy.stats import mad_std
 import ccdproc
 import numpy as np
 import warnings
 from datetime import datetime
-from . import _utils
 
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
 
 class CombMaster:
     """
-    Class to create master calibration frames (bias, dark, flat) for FLI KL4040.
-    Handles .fits and .fits.bz2 inputs. Masters are saved as uncompressed .fits.
+    Class to create master calibration frames (i.e., bias, dark, flat) for astronomical ccd frame.
+    Handles FITS-like nddata inputs. Masters are saved as .fits.
     """
 
     def __init__(self, log_file: str = None):
@@ -27,9 +25,11 @@ class CombMaster:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
+        
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         self.logger.addHandler(handler)
+        
         if log_file:
             file_h = logging.FileHandler(log_file)
             file_h.setFormatter(handler.formatter)
@@ -45,31 +45,31 @@ class CombMaster:
         for fpath in file_list:
             fpath = Path(fpath)
             try:
-                ccd = CCDData.read(fpath)
+                ccd = CCDData.read(fpath, unit="adu")
                 ccd_list.append(ccd)
             except Exception as e:
                 self.logger.error(f"Failed to load {fpath.name}: {e}")
         return ccd_list
 
-    def make_mbias(self, bias_frames_paths, master_dir):
+    def comb_master_bias(self, bias_frames, master_dir, outname):
         """
         Combine multiple bias frames into a single master bias frame.
-        Input: List of paths (.fits or .fits.bz2)
+        Input: List of paths (.fits)
         Output: Master Bias (.fits)
         """
         self.logger.info("Starting master bias combination...")
         master_dir = Path(master_dir)
         master_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 1. Load data from .fits.bz2 files into CCDData objects
-        bias_ccds = self._load_ccd_list(bias_frames_paths)
+
+        # 1. Load data from fits files into CCDData objects
+        bias_ccds = self._load_ccd_list(bias_frames)
         if not bias_ccds:
-            self.logger.error("No bias frames loaded. Aborting make_mbias.")
+            self.logger.error("No bias frames loaded. Aborting comb_master_bias.")
             return None
 
-        hdr0 = bias_ccds[0].header
+        hdr0 = bias_ccds[0].header # load first header for metadata
         obsdate = hdr0.get('OBSDATE', Time(hdr0['JD'], format='jd').to_datetime().strftime('%Y%m%d'))
-        out_name = master_dir / f"snucamii.bias.comb.{obsdate}.fits"
+        fpath_mbias = master_dir / f"{outname}.bias.comb.{obsdate}.fits"
 
         # 2. Combine the list of CCDData objects
         self.logger.info(f"Combining {len(bias_ccds)} bias CCDData objects...")
@@ -84,59 +84,63 @@ class CombMaster:
             mem_limit=500e6,
             dtype=np.float32
         )
+
+        # Update metadata
         mbias.meta.update({
+            'BUNIT': 'ADU',
             'COMBINED': (True, "Combined frame?"),
             'NCOMBINE': (len(bias_ccds), "Number of combined frames"),
-            # 'IMAGETYP': 'BIAS',
+            'IMAGETYP': ('BIAS', "Image type"),
             'JD': (hdr0.get('JD', 'NaN'), "Julian Date of first bias"),
-            'OBSDATE': (obsdate, "YYYYMMDD observation date"),
-            'HISTORY': f"({datetime.now().isoformat()}) Combined {len(bias_ccds)} bias frames."
+            'OBSDATE': (obsdate, "YYYYMMDD observation date (UTC)"),
+            'HISTORY': f"({datetime.now().isoformat()}) Combined {len(bias_ccds)} bias frames.",
+            'HISTORY': f"({datetime.now().isoformat()}) IMAGETYP set to {hdr0['IMAGETYP']} --> BIAS.",
         })
 
-        # 3. Save as uncompressed .fits
-        new_hdu = fits.PrimaryHDU(data=mbias.data, header=mbias.meta)
-        new_hdu.writeto(out_name, overwrite=True)
-        self.logger.info(f"Master bias saved to {out_name.name}")
+        # 3. Save as fits
+        hdu_mbias = fits.PrimaryHDU(data=mbias.data, header=mbias.meta)
+        hdu_mbias.writeto(fpath_mbias, overwrite=True)
+        self.logger.info(f"Master bias saved to {fpath_mbias.name}")
         
-        return out_name
+        return fpath_mbias
 
-    def make_mdark(self, dark_frames_paths, master_dir, key_exptime='EXPTIME'):
+    def comb_master_dark(self, dark_frames, master_dir, outname, key_exptime='EXPTIME'):
         """
         Create master dark frames by subtracting a master bias and combining per exposure time.
-        Input: List of paths (.fits or .fits.bz2)
+        Input: List of paths (.fits)
         Output: Master Darks (.fits)
         """
         self.logger.info("Starting master dark creation...")
         master_dir = Path(master_dir)
         
-        # 1. Load Master Bias (uncompressed .fits)
+        # 1. Load master bias
         mbias_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='BIAS')
         if not mbias_coll.files:
-            self.logger.error("No master bias found in {master_dir}. Run make_mbias first.")
+            self.logger.error(f"No master bias found in {master_dir}. Run comb_master_bias first.")
             return []
             
         # 2. Load all dark frames
-        dark_ccds = self._load_ccd_list(dark_frames_paths)
+        dark_ccds = self._load_ccd_list(dark_frames)
         if not dark_ccds:
-            self.logger.error("No dark frames loaded. Aborting make_mdark.")
+            self.logger.error("No dark frames loaded. Aborting comb_master_dark.")
             return []
         
-        # 3. Find closest bias
-        hdr0_dark = dark_ccds[0].header
-        obs_jd = hdr0_dark['JD']
+        # 3. Find closest master bias
+        hdr0 = dark_ccds[0].header
+        obs_jd = hdr0['JD']
         df_bias = mbias_coll.summary.to_pandas()
         jd_key = 'jd' if 'jd' in df_bias.columns else 'JD'
         jd_series = df_bias[jd_key].astype(float)
         idx = (abs(jd_series - obs_jd)).idxmin()
         bias_path = Path(mbias_coll.files_filtered(include_path=True)[idx])
-        mbias = CCDData.read(bias_path, unit='adu')
+        mbias = CCDData.read(bias_path)
         self.logger.info(f"Using master bias: {bias_path.name}")
         
         # 4. Group darks by exposure time and subtract bias
         grouped_darks = {}
         for ccd in dark_ccds:
             try:
-                # EXPTIME 또는 exptime 키 확인
+                # Check exptime key
                 if key_exptime.upper() in ccd.header:
                     exptime = float(ccd.header[key_exptime.upper()])
                 elif key_exptime.lower() in ccd.header:
@@ -146,7 +150,7 @@ class CombMaster:
                     continue
                 
                 bdark = ccdproc.subtract_bias(ccd, mbias)
-                bdark.meta['history'] = f"Bias: {bias_path.name}"
+                bdark.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {bias_path.name}"
                 if exptime not in grouped_darks:
                     grouped_darks[exptime] = []
                 grouped_darks[exptime].append(bdark)
@@ -154,29 +158,45 @@ class CombMaster:
                 self.logger.error(f"Failed to bias-subtract {ccd.meta.get('FILENAME', 'unknown file')}: {e}")
 
         # 5. Combine groups and save
-        out_files = []
-        for exp, ccd_list in grouped_darks.items():
-            self.logger.info(f"Combining {len(ccd_list)} darks for exptime {exp}s...")
-            obsdate = hdr0_dark.get('OBSDATE', Time(hdr0_dark['JD'], format='jd').to_datetime().strftime('%Y%m%d'))
-            out_dark = master_dir / f"kl4040.dark.{int(round(exp))}s.comb.{obsdate}.fits"
+        mdark_frames = []
+        for exp, bdark_ccds in grouped_darks.items():
             
-            mdark = ccdproc.combine(ccd_list, method='median', sigma_clip=True,
-                                 sigma_clip_low_thresh=5, sigma_clip_high_thresh=5,
-                                 sigma_clip_func=np.ma.median, sigma_clip_dev_func=mad_std,
-                                 mem_limit=500e6, dtype=np.float32)
+            self.logger.info(f"Combining {len(bdark_ccds)} darks for exptime {exp}s...")
+            obsdate = hdr0.get('OBSDATE', Time(hdr0['JD'], format='jd').to_datetime().strftime('%Y%m%d'))
+            fpath_mdark = master_dir / f"{outname}.dark.{int(round(exp))}s.comb.{obsdate}.fits"
             
-            mdark.meta.update({'COMBINED': True,'NCOMBINE': len(ccd_list),'IMAGETYP':'DARK',
-                               'EXPTIME': (exp, "Exposure Time (sec)"),
-                               'JD': (hdr0_dark.get('JD', 'NaN'), "Julian Date of first dark"),
-                               'OBSDATE': (obsdate, "YYYYMMDD observation date"),
-                               'HISTORY':f"Combined {len(ccd_list)} darks at {datetime.now().isoformat()}"})
+            mdark = ccdproc.combine(
+                bdark_ccds,
+                method='median',
+                sigma_clip=True,
+                sigma_clip_low_thresh=5,
+                sigma_clip_high_thresh=5,
+                sigma_clip_func=np.ma.median,
+                sigma_clip_dev_func=mad_std,
+                mem_limit=500e6,
+                dtype=np.float32
+            )
+
+            # Update metadata
+            mbias.meta.update({
+                'BUNIT': 'ADU',
+                'COMBINED': (True, "Combined frame?"),
+                'EXPTIME': (exp, "Exposure time (sec)"),
+                'NCOMBINE': (len(bdark_ccds), "Number of combined frames"),
+                'IMAGETYP': ('DARK', "Image type"),
+                'JD': (hdr0.get('JD', 'NaN'), "Julian Date of first bias"),
+                'OBSDATE': (obsdate, "YYYYMMDD observation date (UTC)"),
+                'HISTORY': f"({datetime.now().isoformat()}) Combined {len(bdark_ccds)} bias frames.",
+                'HISTORY': f"({datetime.now().isoformat()}) IMAGETYP set to {hdr0['IMAGETYP']} --> BIAS.",
+            })
             
-            new_hdu = fits.PrimaryHDU(data=mdark.data, header=mdark.meta)
-            new_hdu.writeto(out_dark, overwrite=True)
-            self.logger.info(f"Master dark saved to {out_dark.name}")
-            out_files.append(out_dark)
+            # 6. Save as fits
+            hdu_mdark = fits.PrimaryHDU(data=mdark.data, header=mdark.meta)
+            hdu_mdark.writeto(fpath_mdark, overwrite=True)
+            self.logger.info(f"Master dark saved to {fpath_mdark.name}")
+            mdark_frames.append(fpath_mdark)
             
-        return out_files
+        return mdark_frames
 
     # def make_mflat(self, flat_frames_paths, master_dir, filter_name, key_exptime='EXPTIME'):
     #     """
