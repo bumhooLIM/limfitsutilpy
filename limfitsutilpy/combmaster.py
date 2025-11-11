@@ -5,6 +5,7 @@ from astropy.time import Time
 from astropy.wcs import FITSFixedWarning
 from astropy.nddata import CCDData
 from astropy.stats import mad_std
+import astropy.units as u
 import ccdproc
 import numpy as np
 import warnings
@@ -14,13 +15,20 @@ warnings.filterwarnings("ignore", category=FITSFixedWarning)
 
 class CombMaster:
     """
-    Class to create master calibration frames (i.e., bias, dark, flat) for astronomical ccd frame.
+    Class to create master calibration frames (i.e., bias, dark, flat) 
+    for astronomical ccd frame.
     Handles FITS-like nddata inputs. Masters are saved as .fits.
     """
 
     def __init__(self, log_file: str = None):
         """
-        Initialize CombMaster with optional file logging.
+        Initializes the CombMaster class and configures logging.
+
+        Parameters
+        ----------
+        log_file : str, optional
+            Path to a file where logs should be saved, in addition to
+            streaming to the console.
         """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.setLevel(logging.INFO)
@@ -36,7 +44,20 @@ class CombMaster:
             self.logger.addHandler(file_h)
 
     def _load_ccd_list(self, file_list):
-        """Helper to load a list of .fits paths into CCDData objects."""
+        """
+        Helper to load a list of FITS file paths into CCDData objects.
+
+        Parameters
+        ----------
+        file_list : list[str or Path]
+            A list of file paths to be loaded.
+
+        Returns
+        -------
+        list[CCDData]
+            A list of loaded CCDData objects. Frames that fail to load
+            are logged and skipped.
+        """
         ccd_list = []
         if not file_list:
             return ccd_list
@@ -51,11 +72,154 @@ class CombMaster:
                 self.logger.error(f"Failed to load {fpath.name}: {e}")
         return ccd_list
 
+    def _find_closest_bias(self, master_dir, target_jd):
+        """
+        Find the master bias frame closest in time (JD) to the target.
+
+        Parameters
+        ----------
+        master_dir : Path
+            Directory to search for master bias files.
+        target_jd : float
+            The Julian Date of the target frame (e.g., dark or flat).
+
+        Returns
+        -------
+        tuple (CCDData, Path) or (None, None)
+            A tuple containing the loaded CCDData object of the master bias
+            and its Path, or (None, None) if not found or an error occurs.
+        """
+        self.logger.info(f"Searching for closest master bias to JD {target_jd} in {master_dir}...")
+        try:
+            mbias_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='BIAS')
+            if not mbias_coll.files:
+                self.logger.error(f"No master bias found in {master_dir}.")
+                return None, None
+            
+            df_bias = mbias_coll.summary.to_pandas()
+            
+            # Find JD column
+            if 'jd' in df_bias.columns:
+                jd_key = 'jd'
+            elif 'JD' in df_bias.columns:
+                jd_key = 'JD'
+            else:
+                self.logger.error("Could not find 'jd' or 'JD' column in master bias summary.")
+                return None, None
+                
+            df_bias[jd_key] = df_bias[jd_key].astype(float)
+            df_bias['diff'] = (df_bias[jd_key] - target_jd).abs()
+            idx = df_bias['diff'].idxmin()
+            
+            bias_path = Path(mbias_coll.files_filtered(include_path=True)[idx])
+            mbias = CCDData.read(bias_path, unit='adu')
+            
+            return mbias, bias_path
+            
+        except Exception as e:
+            self.logger.error(f"Failed to find or load closest master bias: {e}")
+            return None, None
+
+    def _find_closest_dark(self, master_dir, target_jd, target_exptime):
+        """
+        Find the master dark frame closest in exposure time, then closest in time (JD).
+
+        Parameters
+        ----------
+        master_dir : Path
+            Directory to search for master dark files.
+        target_jd : float
+            The Julian Date of the target frame (e.g., flat).
+        target_exptime : float
+            The exposure time (in seconds) of the target frame.
+
+        Returns
+        -------
+        tuple (CCDData, Path) or (None, None)
+            A tuple containing the loaded CCDData object of the master dark
+            and its Path, or (None, None) if not found or an error occurs.
+        """
+        self.logger.info(f"Searching for closest master dark to JD {target_jd}, Exp {target_exptime}s...")
+        try:
+            mdark_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='DARK')
+            if not mdark_coll.files:
+                self.logger.warning(f"No master darks found in {master_dir}.")
+                return None, None
+            
+            df_darks = mdark_coll.summary.to_pandas()
+
+            # Find JD column
+            if 'jd' in df_darks.columns:
+                jd_key = 'jd'
+            elif 'JD' in df_darks.columns:
+                jd_key = 'JD'
+            else:
+                self.logger.error("Could not find 'jd' or 'JD' column in master dark summary.")
+                return None, None
+                
+            # Find EXPTIME column
+            if 'exptime' in df_darks.columns:
+                exp_key = 'exptime'
+            elif 'EXPTIME' in df_darks.columns:
+                exp_key = 'EXPTIME'
+            else:
+                self.logger.error("Could not find 'exptime' or 'EXPTIME' column in master dark summary.")
+                return None, None
+                
+            df_darks[jd_key] = df_darks[jd_key].astype(float)
+            df_darks[exp_key] = df_darks[exp_key].astype(float)
+
+            # Step 1: Find closest exposure time
+            available_exptimes = df_darks[exp_key].unique()
+            if len(available_exptimes) == 0:
+                 self.logger.warning(f"No master darks with valid exposure times found in {master_dir}.")
+                 return None, None
+                 
+            closest_exptime = min(available_exptimes, key=lambda x: abs(x - target_exptime))
+            if abs(closest_exptime - target_exptime) > 1.0: # 1초 이상 차이나면 경고
+                self.logger.warning(f"Target exptime {target_exptime}s, using closest master dark exptime {closest_exptime}s.")
+
+            # Step 2: Filter by that exptime
+            df_filtered = df_darks[df_darks[exp_key] == closest_exptime].copy()
+            if df_filtered.empty:
+                self.logger.error(f"Logic error: No darks found after filtering for closest exptime {closest_exptime}s.")
+                return None, None
+
+            # Step 3: Find closest JD from the filtered set
+            df_filtered['jd_diff'] = (df_filtered[jd_key] - target_jd).abs()
+            idx = df_filtered['jd_diff'].idxmin() # This is the index from the original df_darks/collection
+            
+            dark_path = Path(mdark_coll.files_filtered(include_path=True)[idx])
+            mdark = CCDData.read(dark_path, unit='adu')
+            
+            return mdark, dark_path
+
+        except Exception as e:
+            self.logger.error(f"Failed to find or load closest master dark: {e}")
+            return None, None
+
     def comb_master_bias(self, bias_frames, master_dir, outname):
         """
         Combine multiple bias frames into a single master bias frame.
-        Input: List of paths (.fits)
-        Output: Master Bias (.fits)
+
+        This method loads all specified bias frames, combines them using a
+        median, sigma-clipped algorithm, and saves the result as a
+        master bias FITS file.
+
+        Parameters
+        ----------
+        bias_frames : list[str or Path]
+            List of file paths to the raw bias frames.
+        master_dir : str or Path
+            Directory where the master bias frame will be saved.
+        outname : str
+            Base name for the output file (e.g., 'camera_serial').
+
+        Returns
+        -------
+        Path or None
+            The Path to the created master bias file, or None if
+            the combination failed.
         """
         self.logger.info("Starting master bias combination...")
         master_dir = Path(master_dir)
@@ -106,37 +270,51 @@ class CombMaster:
 
     def comb_master_dark(self, dark_frames, master_dir, outname, key_exptime='EXPTIME'):
         """
-        Create master dark frames by subtracting a master bias and combining per exposure time.
-        Input: List of paths (.fits)
-        Output: Master Darks (.fits)
+        Create master dark frames from raw darks, grouped by exposure time.
+
+        This method finds the closest master bias, subtracts it from all
+        raw darks, groups the bias-subtracted darks by their exposure time,
+        combines each group, and saves them as separate master dark files.
+
+        Parameters
+        ----------
+        dark_frames : list[str or Path]
+            List of file paths to the raw dark frames.
+        master_dir : str or Path
+            Directory to search for master bias and to save master darks.
+        outname : str
+            Base name for the output files (e.g., 'camera_serial').
+        key_exptime : str, optional
+            The FITS header keyword for exposure time (default 'EXPTIME').
+
+        Returns
+        -------
+        list[Path]
+            A list of Paths to the created master dark files (one for each
+            exposure time). Returns an empty list on failure.
         """
         self.logger.info("Starting master dark creation...")
         master_dir = Path(master_dir)
-        
-        # 1. Load master bias
-        mbias_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='BIAS')
-        if not mbias_coll.files:
-            self.logger.error(f"No master bias found in {master_dir}. Run comb_master_bias first.")
-            return []
             
-        # 2. Load all dark frames
+        # 1. Load all dark frames
         dark_ccds = self._load_ccd_list(dark_frames)
         if not dark_ccds:
             self.logger.error("No dark frames loaded. Aborting comb_master_dark.")
             return []
         
-        # 3. Find closest master bias
+        # 2. Find closest master bias
         hdr0 = dark_ccds[0].header
         obs_jd = hdr0['JD']
-        df_bias = mbias_coll.summary.to_pandas()
-        jd_key = 'jd' if 'jd' in df_bias.columns else 'JD'
-        jd_series = df_bias[jd_key].astype(float)
-        idx = (abs(jd_series - obs_jd)).idxmin()
-        bias_path = Path(mbias_coll.files_filtered(include_path=True)[idx])
-        mbias = CCDData.read(bias_path)
+        mbias, bias_path = self._find_closest_bias(master_dir, obs_jd)
+        
+        if mbias is None:
+            # The helper logged the error. We can't proceed.
+            self.logger.error(f"Master bias not found. Aborting comb_master_dark.")
+            return []
+            
         self.logger.info(f"Using master bias: {bias_path.name}")
         
-        # 4. Group darks by exposure time and subtract bias
+        # 3. Group darks by exposure time and subtract bias
         grouped_darks = {}
         for ccd in dark_ccds:
             try:
@@ -157,7 +335,7 @@ class CombMaster:
             except Exception as e:
                 self.logger.error(f"Failed to bias-subtract {ccd.meta.get('FILENAME', 'unknown file')}: {e}")
 
-        # 5. Combine groups and save
+        # 4. Combine groups and save
         mdark_frames = []
         for exp, bdark_ccds in grouped_darks.items():
             
@@ -178,19 +356,19 @@ class CombMaster:
             )
 
             # Update metadata
-            mbias.meta.update({
+            mdark.meta.update({
                 'BUNIT': 'ADU',
                 'COMBINED': (True, "Combined frame?"),
                 'EXPTIME': (exp, "Exposure time (sec)"),
                 'NCOMBINE': (len(bdark_ccds), "Number of combined frames"),
                 'IMAGETYP': ('DARK', "Image type"),
-                'JD': (hdr0.get('JD', 'NaN'), "Julian Date of first bias"),
+                'JD': (hdr0.get('JD', 'NaN'), "Julian Date of first dark"),
                 'OBSDATE': (obsdate, "YYYYMMDD observation date (UTC)"),
-                'HISTORY': f"({datetime.now().isoformat()}) Combined {len(bdark_ccds)} bias frames.",
-                'HISTORY': f"({datetime.now().isoformat()}) IMAGETYP set to {hdr0['IMAGETYP']} --> BIAS.",
+                'HISTORY': f"({datetime.now().isoformat()}) Combined {len(bdark_ccds)} dark frames.",
+                'HISTORY': f"({datetime.now().isoformat()}) IMAGETYP set to {hdr0['IMAGETYP']} --> DARK.",
             })
             
-            # 6. Save as fits
+            # 5. Save as fits
             hdu_mdark = fits.PrimaryHDU(data=mdark.data, header=mdark.meta)
             hdu_mdark.writeto(fpath_mdark, overwrite=True)
             self.logger.info(f"Master dark saved to {fpath_mdark.name}")
@@ -198,107 +376,132 @@ class CombMaster:
             
         return mdark_frames
 
-    # def make_mflat(self, flat_frames_paths, master_dir, filter_name, key_exptime='EXPTIME'):
-    #     """
-    #     Create a master flat frame by subtracting bias and dark.
-    #     Input: List of paths (.fits or .fits.bz2)
-    #     Output: Master Flat (.fits)
-    #     """
-    #     self.logger.info(f"Starting master flat creation for filter {filter_name}...")
-    #     master_dir = Path(master_dir)
+    def comb_master_flat(self, flat_frames, master_dir, outname, filter_name, key_exptime='EXPTIME'):
+        """
+        Create a master flat frame for a specific filter.
+
+        This method processes raw flat frames by:
+        1. Finding and subtracting the closest master bias (by JD).
+        2. Finding and subtracting the closest master dark (by exptime, then JD).
+        3. Combining the processed flats using a median, sigma-clipped
+           algorithm with INVERSE MEDIAN SCALING (1/median) applied
+           to each frame before combination.
+        4. Saving the result as a single master flat FITS file.
+
+        Parameters
+        ----------
+        flat_frames : list[str or Path]
+            List of file paths to the raw flat frames for this filter.
+        master_dir : str or Path
+            Directory to search for master bias/darks and to save the master flat.
+        outname : str
+            Base name for the output file (e.g., 'camera_serial').
+        filter_name : str
+            The name of the filter (e.g., 'R', 'G', 'B') for this flat.
+            This will be included in the output filename and metadata.
+        key_exptime : str, optional
+            The FITS header keyword for exposure time (default 'EXPTIME').
+
+        Returns
+        -------
+        Path or None
+            The Path to the created master flat file, or None if
+            the combination failed.
+        """
+        self.logger.info(f"Starting master flat creation for filter {filter_name}...")
+        master_dir = Path(master_dir)
         
-    #     # 1. Load flats
-    #     flat_ccds = self._load_ccd_list(flat_frames_paths)
-    #     if not flat_ccds:
-    #         self.logger.error("No flat frames loaded. Aborting make_mflat.")
-    #         return None
-
-    #     # 2. Load Master Bias
-    #     mbias_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='BIAS')
-    #     if not mbias_coll.files:
-    #         self.logger.error(f"No master bias found in {master_dir}. Run make_mbias first.")
-    #         return None
-        
-    #     # 3. Load Master Darks (dict by exptime)
-    #     mdark_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='DARK')
-    #     if not mdark_coll.files:
-    #         self.logger.warning(f"No master darks found in {master_dir}. Proceeding without dark subtraction for flats.")
-    #         mdarks = {}
-    #     else:
-    #         mdarks = {float(h['EXPTIME']): ccdproc.CCDData.read(p, unit='adu') 
-    #                   for p, h in mdark_coll.headers(include_path=True).items()}
-
-    #     # 4. Find closest bias
-    #     hdr0_flat = flat_ccds[0].header
-    #     obs_jd = hdr0_flat['JD']
-    #     jd_series = mbias_coll.summary['jd'].astype(float)
-    #     idx = (abs(jd_series - obs_jd)).idxmin()
-    #     bias_path = Path(mbias_coll.files_filtered(include_path=True)[idx])
-    #     mbias = CCDData.read(bias_path, unit='adu')
-    #     self.logger.info(f"Using master bias: {bias_path.name}")
-
-    #     # 5. Process flats (bias and dark subtraction)
-    #     processed_flats = []
-    #     for ccd in flat_ccds:
-    #         try:
-    #             bflat = ccdproc.subtract_bias(ccd, mbias)
-                
-    #             # EXPTIME 또는 exptime 키 확인
-    #             if key_exptime.upper() in ccd.header:
-    #                 exptime = float(ccd.header[key_exptime.upper()])
-    #             elif key_exptime.lower() in ccd.header:
-    #                 exptime = float(ccd.header[key_exptime.lower()])
-    #             else:
-    #                 self.logger.warning(f"Cannot find key {key_exptime} in {ccd.meta['FILENAME']}. Skipping dark subtraction.")
-    #                 processed_flats.append(bflat)
-    #                 continue
-
-    #             # Find closest dark
-    #             if not mdarks:
-    #                 processed_flats.append(bflat) # No darks available
-    #                 continue
-                    
-    #             closest_exp_dark = min(mdarks.keys(), key=lambda k: abs(k - exptime))
-    #             mdark = mdarks[closest_exp_dark]
-    #             if abs(closest_exp_dark - exptime) > 1.0: # 1초 이상 차이나면 경고
-    #                 self.logger.warning(f"Using dark {closest_exp_dark}s for flat {exptime}s.")
-                
-    #             bdflat = ccdproc.subtract_dark(bflat, mdark, exposure_time=key_exptime, exposure_unit=u.second)
-    #             processed_flats.append(bdflat)
-                
-    #         except Exception as e:
-    #             self.logger.error(f"Failed to process flat {ccd.meta.get('FILENAME', 'unknown file')}: {e}")
-
-    #     # 6. Combine processed flats
-    #     if not processed_flats:
-    #         self.logger.error("No flat frames were successfully processed.")
-    #         return None
+        # 1. Load flats
+        flat_ccds = self._load_ccd_list(flat_frames)
+        if not flat_ccds:
+            self.logger.error("No flat frames loaded. Aborting comb_master_flat.")
+            return None
             
-    #     self.logger.info(f"Combining {len(processed_flats)} processed flat frames...")
-        
-    #     def inv_median_scale(a):
-    #         return 1.0 / np.nanmedian(a)
+        hdr0_flat = flat_ccds[0].header
+        obs_jd = hdr0_flat['JD']
 
-    #     mflat = ccdproc.combine(processed_flats,
-    #                          method='median',
-    #                          scale=inv_median_scale, # 스케일링
-    #                          sigma_clip=True,
-    #                          sigma_clip_low_thresh=5,
-    #                          sigma_clip_high_thresh=5,
-    #                          sigma_clip_func=np.ma.median,
-    #                          sigma_clip_dev_func=mad_std,
-    #                          mem_limit=500e6,
-    #                          dtype=np.float32
-    #                          )
+        # 2. Load Master Bias
+        mbias, bias_path = self._find_closest_bias(master_dir, obs_jd)
+        if mbias is None:
+            self.logger.error(f"Master bias not found. Aborting comb_master_flat.")
+            return None
+        self.logger.info(f"Using master bias: {bias_path.name}")
         
-    #     obsdate = hdr0_flat.get('OBSDATE', Time(hdr0_flat['JD'], format='jd').to_datetime().strftime('%Y%m%d'))
-    #     out_flat = master_dir / f"kl4040.flat.{filter_name}.{obsdate}.fits"
-        
-    #     mflat.meta.update({'COMBINED': True, 'NCOMBINE': len(processed_flats),
-    #                        'FILTER': filter_name, 'IMAGETYP':'FLAT',
-    #                        'HISTORY':f"Combined {len(processed_flats)} flats at {datetime.now().isoformat()}"})
+        # 3. Process flats (bias and dark subtraction)
+        processed_flats = []
+        for ccd in flat_ccds:
+            try:
+                bflat = ccdproc.subtract_bias(ccd, mbias)
+                bflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {bias_path.name}"
+                
+                # Get exptime key
+                if key_exptime.upper() in ccd.header:
+                    exptime = float(ccd.header[key_exptime.upper()])
+                elif key_exptime.lower() in ccd.header:
+                    exptime = float(ccd.header[key_exptime.lower()])
+                else:
+                    self.logger.warning(f"Cannot find key {key_exptime} in {ccd.meta.get('FILENAME', 'unknown file')}. Skipping dark subtraction.")
+                    processed_flats.append(bflat)
+                    continue
 
-    #     new_hdu = fits.PrimaryHDU(data=mflat.data, header=mflat.meta)
-    #     _utils.write_fits_any(out_flat, new_hdu, as_bz2=False) # Save as .fits
-    #     self.logger.info(f"Master flat saved to {out_flat.name}")
-    #     return out_flat
+                # Find closest dark using new logic
+                mdark, dark_path = self._find_closest_dark(master_dir, ccd.header['JD'], exptime)
+
+                if mdark is None:
+                    # No dark found (or no darks exist). Log it and append the bias-subtracted flat.
+                    self.logger.warning(f"No matching master dark found for flat {ccd.meta.get('FILENAME', 'unknown file')} (JD={ccd.header['JD']}, Exp={exptime}s). Proceeding without dark subtraction.")
+                    processed_flats.append(bflat)
+                    continue # Skip to the next flat
+
+                # Dark was found, proceed with subtraction
+                self.logger.info(f"Using master dark: {dark_path.name} for flat {ccd.meta.get('FILENAME', 'unknown file')}")
+                bdflat = ccdproc.subtract_dark(bflat, mdark, exposure_time=key_exptime, exposure_unit=u.second)
+                bdflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master dark subtracted: {dark_path.name}"
+                processed_flats.append(bdflat)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to process flat {ccd.meta.get('FILENAME', 'unknown file')}: {e}")
+
+        # 4. Combine processed flats
+        if not processed_flats:
+            self.logger.error("No flat frames were successfully processed.")
+            return None
+            
+        self.logger.info(f"Combining {len(processed_flats)} processed flat frames...")
+        
+        # Define scaling function: 1 / median
+        def inv_median_scale(a):
+            return 1.0 / np.nanmedian(a)
+
+        mflat = ccdproc.combine(processed_flats,
+                             method='median',
+                             scale=inv_median_scale, # Scale by inverse median
+                             sigma_clip=True,
+                             sigma_clip_low_thresh=5,
+                             sigma_clip_high_thresh=5,
+                             sigma_clip_func=np.ma.median,
+                             sigma_clip_dev_func=mad_std,
+                             mem_limit=500e6,
+                             dtype=np.float32
+                             )
+        
+        obsdate = hdr0_flat.get('OBSDATE', Time(hdr0_flat['JD'], format='jd').to_datetime().strftime('%Y%m%d'))
+        fpath_mflat = master_dir / f"{outname}.flat.{filter_name}.comb.{obsdate}.fits"
+        
+        mflat.meta.update({
+            'BUNIT': 'ADU',
+            'COMBINED': (True, "Combined frame?"),
+            'NCOMBINE': (len(processed_flats), "Number of combined frames"),
+            'IMAGETYP': ('FLAT', "Image type"),
+            'FILTER': (filter_name, "Filter name"),
+            'JD': (hdr0_flat.get('JD', 'NaN'), "Julian Date of first flat"),
+            'OBSDATE': (obsdate, "YYYYMMDD observation date (UTC)"),
+            'HISTORY':f"Combined {len(processed_flats)} flats at {datetime.now().isoformat()}",
+            'HISTORY':f"({datetime.now().isoformat()}) IMAGETYP set to {hdr0_flat['IMAGETYP']} --> FLAT.",
+        })
+
+        hdu_mflat = fits.PrimaryHDU(data=mflat.data, header=mflat.meta)
+        hdu_mflat.writeto(fpath_mflat, overwrite=True) # Save as .fits
+        self.logger.info(f"Master flat saved to {fpath_mflat.name}")
+        
+        return fpath_mflat
