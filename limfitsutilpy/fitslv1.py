@@ -188,14 +188,14 @@ class FitsLv1:
             self.logger.error(f"Header key {e} not found (for {key_ra}/{key_dec}). Aborting WCS solve.")
             return
         except (ValueError, TypeError):
-             self.logger.error(f"Could not convert RA/DEC from header ({key_ra}, {key_dec}) to float.")
-             return
+            self.logger.error(f"Could not convert RA/DEC from header ({key_ra}, {key_dec}) to float.")
+            return
 
         # Solve WCS
         wcs_solved = False
         try:
             with astrometry.Solver(
-                index_func.index_files( # <-- Use dynamic index function
+                index_func.index_files(
                     cache_directory=cache_directory, 
                     scales=dynamic_scales  
                 ),
@@ -208,9 +208,9 @@ class FitsLv1:
                         upper_arcsec_per_pixel=upper_px_scale
                     ),
                     position_hint=astrometry.PositionHint(
-                        ra_deg=ra_hint, # <-- Use hint from header
-                        dec_deg=dec_hint, # <-- Use hint from header
-                        radius_deg=search_radius_deg # <-- Use argument
+                        ra_deg=ra_hint,
+                        dec_deg=dec_hint,
+                        radius_deg=search_radius_deg
                     ),
                     solution_parameters=astrometry.SolutionParameters(
                         logodds_callback=lambda l: astrometry.Action.STOP if len(l)>=10 else astrometry.Action.CONTINUE,
