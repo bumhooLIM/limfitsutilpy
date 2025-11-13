@@ -11,12 +11,13 @@ import astrometry # type: ignore
 import sep
 import numpy as np
 
-class Lv1:
+class FitsLv1:
     """
-    Class for Level-1 processing of RASA lcpy KL4040 science frames.
+    Class for Level-1 processing of FITS.
+    - Find and update WCS information (update_wcs).
+    - Bias, dark, and flat corrections (preprocessing).
 
-    Provides methods to solve and update WCS, and to apply bias, dark, and flat corrections.
-    Handles .fits and .fits.bz2 file I/O.
+    It assumes input files are uncompressed FITS.
     """
 
     def __init__(self, log_file: str = None):

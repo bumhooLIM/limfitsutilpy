@@ -6,11 +6,12 @@ from astropy.time import Time
 import astropy.units as u
 from datetime import datetime
 from pathlib import Path
-class Lv0:
+class FitsLv0:
     """
-    Class for calibration Level 0.
+    Class for Level-0 processing of FITS.
     - update FITS headers for Level-0 raw data (update_header).
-    - Assumes input files are uncompressed .fits files.
+    
+    It assumes input files are uncompressed FITS.
     """
 
     def __init__(self, log_file: str | None = None):
