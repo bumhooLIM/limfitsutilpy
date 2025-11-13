@@ -447,7 +447,7 @@ class CombMaster:
                     processed_flats.append(bflat)
                     continue
 
-                # Find closest dark using new logic
+                # Find closest dark
                 mdark, dark_path = self._find_closest_dark(master_dir, ccd.header['JD'], exptime)
 
                 if mdark is None:
