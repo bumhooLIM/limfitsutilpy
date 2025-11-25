@@ -66,7 +66,10 @@ class CombMaster:
         for fpath in file_list:
             fpath = Path(fpath)
             try:
-                ccd = CCDData.read(fpath, unit="adu")
+                ccd = CCDData.read(fpath)
+                ccd_list_with_paths.append((ccd, fpath))
+            except ValueError:
+                ccd = CCDData.read(fpath, unit='adu')
                 ccd_list_with_paths.append((ccd, fpath))
             except Exception as e:
                 self.logger.error(f"Failed to load {fpath.name}: {e}")
