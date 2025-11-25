@@ -92,7 +92,7 @@ class CombMaster:
             A tuple containing the loaded CCDData object of the master bias
             and its Path, or (None, None) if not found or an error occurs.
         """
-        self.logger.info(f"Searching for closest master bias to JD {target_jd} in {master_dir}...")
+        self.logger.info(f"Searching for closest master bias to JD={target_jd:.1f}...")
         try:
             mbias_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='BIAS')
             if not mbias_coll.files:
@@ -114,10 +114,14 @@ class CombMaster:
             df_bias['diff'] = (df_bias[jd_key] - target_jd).abs()
             idx = df_bias['diff'].idxmin()
             
-            bias_path = Path(mbias_coll.files_filtered(include_path=True)[idx])
-            mbias = CCDData.read(bias_path, unit='adu')
+            fpath_mbias = Path(mbias_coll.files_filtered(include_path=True)[idx])
             
-            return mbias, bias_path
+            try:
+                mbias = CCDData.read(fpath_mbias)
+            except ValueError:
+                mbias = CCDData.read(fpath_mbias, unit='adu')
+            
+            return mbias, fpath_mbias
             
         except Exception as e:
             self.logger.error(f"Failed to find or load closest master bias: {e}")
@@ -142,7 +146,7 @@ class CombMaster:
             A tuple containing the loaded CCDData object of the master dark
             and its Path, or (None, None) if not found or an error occurs.
         """
-        self.logger.info(f"Searching for closest master dark to JD {target_jd}, Exp {target_exptime}s...")
+        self.logger.info(f"Searching for closest master dark to JD={target_jd:.1f}, exp={target_exptime:.1f}s...")
         try:
             mdark_coll = ccdproc.ImageFileCollection(master_dir, glob_include='*.fits').filter(imagetyp='DARK')
             if not mdark_coll.files:
@@ -192,10 +196,14 @@ class CombMaster:
             df_filtered['jd_diff'] = (df_filtered[jd_key] - target_jd).abs()
             idx = df_filtered['jd_diff'].idxmin() # This is the index from the original df_darks/collection
             
-            dark_path = Path(mdark_coll.files_filtered(include_path=True)[idx])
-            mdark = CCDData.read(dark_path, unit='adu')
+            fpath_mdark = Path(mdark_coll.files_filtered(include_path=True)[idx])
             
-            return mdark, dark_path
+            try:
+                mdark = CCDData.read(fpath_mdark)
+            except ValueError:
+                mdark = CCDData.read(fpath_mdark, unit='adu')
+            
+            return mdark, fpath_mdark
 
         except Exception as e:
             self.logger.error(f"Failed to find or load closest master dark: {e}")
@@ -311,14 +319,14 @@ class CombMaster:
         # 2. Find closest master bias
         hdr0 = dark_ccds_with_paths[0][0].header # Get header from first CCD
         obs_jd = hdr0['JD']
-        mbias, bias_path = self._find_closest_bias(master_dir, obs_jd)
+        mbias, fpath_mbias = self._find_closest_bias(master_dir, obs_jd)
         
         if mbias is None:
             # The helper logged the error. We can't proceed.
             self.logger.error(f"Master bias not found. Aborting comb_master_dark.")
             return []
-            
-        self.logger.info(f"Using master bias: {bias_path.name}")
+
+        self.logger.info(f"Using master bias: {fpath_mbias.name}")
         
         # 3. Group darks by exposure time and subtract bias
         grouped_darks = {}
@@ -334,7 +342,7 @@ class CombMaster:
                     continue
                 
                 bdark = ccdproc.subtract_bias(ccd, mbias)
-                bdark.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {bias_path.name}"
+                bdark.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {fpath_mbias.name}"
                 if exptime not in grouped_darks:
                     grouped_darks[exptime] = []
                 grouped_darks[exptime].append(bdark)
@@ -427,18 +435,18 @@ class CombMaster:
         obs_jd = hdr0_flat['JD']
 
         # 2. Load Master Bias
-        mbias, bias_path = self._find_closest_bias(master_dir, obs_jd)
+        mbias, fpath_mbias = self._find_closest_bias(master_dir, obs_jd)
         if mbias is None:
             self.logger.error(f"Master bias not found. Aborting comb_master_flat.")
             return None
-        self.logger.info(f"Using master bias: {bias_path.name}")
+        self.logger.info(f"Using master bias: {fpath_mbias.name}")
         
         # 3. Process flats (bias and dark subtraction)
         processed_flats = []
         for ccd, fpath in flat_ccds_with_paths:
             try:
                 bflat = ccdproc.subtract_bias(ccd, mbias)
-                bflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {bias_path.name}"
+                bflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master bias subtracted: {fpath_mbias.name}"
                 
                 # Get exptime key
                 if key_exptime.upper() in ccd.header:
@@ -451,7 +459,7 @@ class CombMaster:
                     continue
 
                 # Find closest dark
-                mdark, dark_path = self._find_closest_dark(master_dir, ccd.header['JD'], exptime)
+                mdark, fpath_mdark = self._find_closest_dark(master_dir, ccd.header['JD'], exptime)
 
                 if mdark is None:
                     # No dark found (or no darks exist). Log it and append the bias-subtracted flat.
@@ -460,9 +468,9 @@ class CombMaster:
                     continue # Skip to the next flat
 
                 # Dark was found, proceed with subtraction
-                self.logger.info(f"Using master dark: {dark_path.name} for flat {fpath.name}")
+                self.logger.info(f"Using master dark: {fpath_mdark.name} for flat {fpath.name}")
                 bdflat = ccdproc.subtract_dark(bflat, mdark, exposure_time=key_exptime, exposure_unit=u.second)
-                bdflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master dark subtracted: {dark_path.name}"
+                bdflat.meta['HISTORY'] = f"({datetime.now().isoformat()}) Master dark subtracted: {fpath_mdark.name}"
                 processed_flats.append(bdflat)
                 
             except Exception as e:
