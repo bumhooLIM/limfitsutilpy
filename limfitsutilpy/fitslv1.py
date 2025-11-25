@@ -116,6 +116,7 @@ class FitsLv1:
         """
         fpath_fits = Path(fpath_fits)
         fpath_out = Path(fpath_out)
+        fpath_out.parent.mkdir(parents=True, exist_ok=True)
 
         # Read science image
         try:
@@ -257,25 +258,28 @@ class FitsLv1:
         if return_fpath:
             return fpath_out
 
-    def preprocessing(self, fpath_fits, outdir, masterdir, return_fpath=True):
+    def preprocessing(self, fpath_fits, fpath_out, masterdir, return_fpath=True):
         """
         Subtract bias, dark, mask bad pixels, and flat-correct.
         Reads .fits and writes Multi-Extension .fits.
         Master frames are assumed to be uncompressed .fits files.
         """
         fpath_fits = Path(fpath_fits)
-        outdir = Path(outdir)
+        fpath_out = Path(fpath_out)
+        fpath_out.parent.mkdir(parents=True, exist_ok=True)
         masterdir = Path(masterdir)
-        outdir.mkdir(parents=True, exist_ok=True)
-
+        
         try:
+            sci = CCDData.read(fpath_fits)
+        except ValueError:
             sci = CCDData.read(fpath_fits, unit='adu')
         except FileNotFoundError:
             self.logger.error(f"File not found: {fpath_fits}")
             return
         except Exception as e:
             self.logger.error(f"Error reading FITS {fpath_fits}: {e}")
-
+            return
+        
         try:
             mbias = self._select_master(masterdir, 'BIAS', sci.header['JD'])
             mdark = self._select_master(masterdir, 'DARK', sci.header['JD'], sci.header['EXPTIME'])
@@ -283,9 +287,15 @@ class FitsLv1:
         except Exception as e:
             self.logger.error(f"Failed to load master frames for {fpath_fits.name}: {e}")
             return
-            
-        # Bias
+        
         try:
+            mask = self._select_master(masterdir, 'MASK', sci.header['JD'])
+        except Exception as e:
+            self.logger.warning(f"Failed to load master mask for {fpath_fits.name}: {e}")
+            mask = None
+        
+        try:
+            # Bias
             bsci = ccdproc.subtract_bias(sci, mbias)
             bsci.meta['BIASCORR'] = (True, "Bias corrected?")
             bsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bias subtracted."
@@ -297,10 +307,15 @@ class FitsLv1:
             bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Dark subtracted."
             self.logger.info(f"Dark subtracted for {fpath_fits.name}")
             
-            # mask (음수 값 마스킹 및 0으로 클리핑)
-            bdsci.mask = bdsci.data < 0
-            bdsci.data = np.nan_to_num(np.clip(bdsci.data, 0, None), nan=0.0)
-            bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bad pixels masked (negative values)."
+            # mask (Mask negative values and clip to 0)
+            mask_negative = bdsci.data < 0
+            if mask is not None:
+                mask = mask_negative | mask.data
+            else:
+                mask = mask_negative
+            bdsci.mask = mask
+            bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bad pixels masked."
+            bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Negative values masked."
             self.logger.info(f"Bad pixels masked for {fpath_fits.name}")
             
             # flat
@@ -313,22 +328,21 @@ class FitsLv1:
             self.logger.error(f"CCD processing failed for {fpath_fits.name}: {e}")
             return
 
-        # 3. 수정된 파일 쓰기 (멀티-익스텐션 FITS)
-        if 'RACEN' not in psci.header or 'DECCEN' not in psci.header:
-            self.logger.warning(f"RACEN/DECCEN not in header for {fpath_fits.name}. Using original name.")
-            # 'image.wcs.fits' -> 'image.wcs.proc.fits'
-            outname = f"{fpath_fits.stem}.proc.fits"
+        # 3. Write the processed file (Multi-Extension FITS)
+        # if 'RACEN' not in psci.header or 'DECCEN' not in psci.header:
+        #     self.logger.warning(f"RACEN/DECCEN not in header for {fpath_fits.name}. Using original name.")
+        #     # 'image.wcs.fits' -> 'image.wcs.proc.fits'
+        #     outname = f"{fpath_fits.stem}.proc.fits"
             
-        else:
-            rac = int(round(psci.header['RACEN']))
-            dec = int(round(psci.header['DECCEN']))
-            pm = 'p' if dec >= 0 else 'n'
-            exp = int(round(psci.header['EXPTIME']))
-            obst = Time(psci.header['DATE-OBS']).strftime("%Y%m%d%H%M%S")
-            # 파일명 .fits로 수정
-            outname = f"kl4040.sci.{rac:03d}.{pm}{abs(dec):02d}.{exp:03d}.{obst}.fits"
-        
-        outpath = outdir / outname
+        # else:
+        #     rac = int(round(psci.header['RACEN']))
+        #     dec = int(round(psci.header['DECCEN']))
+        #     pm = 'p' if dec >= 0 else 'n'
+        #     exp = int(round(psci.header['EXPTIME']))
+        #     obst = Time(psci.header['DATE-OBS']).strftime("%Y%m%d%H%M%S")
+        #     # 파일명 .fits로 수정
+        #     outname = f"kl4040.sci.{rac:03d}.{pm}{abs(dec):02d}.{exp:03d}.{obst}.fits"        
+        # outpath = outdir / outname
         
         # 1. Primary HDU (Science Data) 생성
         primary_hdu = fits.PrimaryHDU(data=psci.data, header=psci.header)
@@ -342,14 +356,14 @@ class FitsLv1:
             hdul_out = fits.HDUList([primary_hdu])
         
         try:
-            hdul_out.writeto(outpath, overwrite=True)
-            self.logger.info(f"Preprocessing complete (MEF): {outname}")
+            hdul_out.writeto(fpath_out, overwrite=True)
+            self.logger.info(f"Preprocessing complete: {fpath_out.name}")
         except Exception as e:
-            self.logger.error(f"Failed to write MEF {outpath}: {e}")
+            self.logger.error(f"Failed to write MEF {fpath_out}: {e}")
             return
             
         if return_fpath:
-            return outpath
+            return fpath_out
 
     def _select_master(self, masterdir, imagetyp, jd_target, exptime=None):
         """
@@ -362,7 +376,7 @@ class FitsLv1:
 
         df = coll.summary.to_pandas()
         
-        # 'jd' 또는 'JD' 키워드 찾기
+        # Find 'jd' or 'JD' column
         jd_col = None
         if 'jd' in df.columns:
             jd_col = 'jd'
@@ -375,7 +389,7 @@ class FitsLv1:
         df['diff'] = (df[jd_col] - jd_target).abs()
         
         if exptime is not None:
-            # 'exptime' 또는 'EXPTIME' 키워드 찾기
+            # Find 'exptime' or 'EXPTIME' column
             exp_col = None
             if 'exptime' in df.columns:
                 exp_col = 'exptime'
@@ -384,7 +398,7 @@ class FitsLv1:
             
             if exp_col:
                 df[exp_col] = df[exp_col].astype(float)
-                # 가장 가까운 노출 시간의 다크 프레임 선택
+                # Select the master dark frame with the closest exposure time
                 available_exptimes = df[exp_col].unique()
                 closest_exptime = min(available_exptimes, key=lambda x: abs(x - float(exptime)))
                 self.logger.info(f"Requested exptime {exptime}, found closest master dark {closest_exptime}")
@@ -398,6 +412,13 @@ class FitsLv1:
         idx = df['diff'].idxmin()
         selected_file = Path(coll.files_filtered(include_path=True)[idx])
         self.logger.info(f"Selected master {imagetyp}: {selected_file.name}")
-        
-        # 마스터 프레임은 .fits이므로 ccdproc.CCDData.read 사용
-        return ccdproc.CCDData.read(selected_file, unit='adu')
+            
+        try:  
+            if imagetyp == 'MASK':   
+                master_frame = CCDData.read(selected_file, unit='bool')
+            else:
+                master_frame = CCDData.read(selected_file)
+        except ValueError:
+            master_frame = ccdproc.CCDData.read(selected_file, unit='adu')
+
+        return master_frame
