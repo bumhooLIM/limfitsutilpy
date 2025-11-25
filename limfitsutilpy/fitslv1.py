@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from astropy.io import fits
-from astropy.coordinates import EarthLocation, AltAz
+from astropy.coordinates import EarthLocation, AltAz, Angle
 from astropy.time import Time
 import astropy.units as u
 from datetime import datetime
@@ -14,37 +14,28 @@ import numpy as np
 # Define scale mappings
 # Based on astrometry.net documentation
 # https://pypi.org/project/astrometry/#choosing-series
-# 4100 series covers 22 to 340 arcminutes
 # Maps scale_number -> (min_arcmin, max_arcmin)
-SCALE_MAP_4100 = {
-    7: (22, 30),
-    8: (30, 42),
-    9: (42, 60),
-    10: (60, 85),
-    11: (85, 120),
-    12: (120, 170),
-    13: (170, 240),
-    14: (240, 340),
-}
-# 5200 series covers 0.1 to 30 arcminutes
-SCALE_MAP_5200 = {
-    0: (0.1, 0.14),
-    1: (0.14, 0.2),
-    2: (0.2, 0.28),
-    3: (0.28, 0.4),
-    4: (0.4, 0.56),
-    5: (0.56, 0.8),
-    6: (0.8, 1.1),
-    7: (1.1, 1.6),
-    8: (1.6, 2.2),
-    9: (2.2, 3.2),
-    10: (3.2, 4.4),
-    11: (4.4, 6.2),
-    12: (6.2, 8.8),
-    13: (8.8, 12),
-    14: (12, 17),
-    15: (17, 24),
-    16: (24, 30),
+SCALE_MAP = {
+    0: (2.0, 2.8),
+    1: (2.8, 4.0),
+    2: (4.0, 5.6),
+    3: (5.6, 8.0),
+    4: (8.0, 11.0),
+    5: (11.0, 16.0),
+    6: (16.0, 22.0),
+    7: (22.0, 30.0),
+    8: (30.0, 42.0),
+    9: (42.0, 60.0),
+    10: (60.0, 85.0),
+    11: (85.0, 120.0),
+    12: (120.0, 170.0),
+    13: (170.0, 240.0),
+    14: (240.0, 340.0),
+    15: (340.0, 480.0),
+    16: (480.0, 680.0),
+    17: (680.0, 1000.0),
+    18: (1000.0, 1400.0),
+    19: (1400.0, 2000.0),
 }
 
 class FitsLv1:
@@ -79,54 +70,52 @@ class FitsLv1:
             file_h.setFormatter(handler.formatter)
             self.logger.addHandler(file_h)
 
-    def _get_dynamic_scales(self, fov_deg: float, scale_map: dict) -> set:
+    def _get_dynamic_scales(self, fov_deg: float) -> set:
         """
         Helper function to select index scales based on FOV.
         Uses the 10% to 100% rule, then selects the 3 middle scales.
         """
+        
         # Convert FOV to arcminutes
-        fov_arcmin = fov_deg * 60
+        fov_arcmin = fov_deg * 60.0
         
         # Calculate the min/max range to search for
         min_search_arcmin = fov_arcmin * 0.1  # 10%
         max_search_arcmin = fov_arcmin * 1.0  # 100%
         
         overlapping_scales = []
-        # Sort the scale_map by scale number to ensure list is sorted
-        sorted_scale_items = sorted(scale_map.items()) 
+        # Sort the map by scale number
+        sorted_scale_items = sorted(SCALE_MAP.items()) 
         
         for scale_num, (scale_min, scale_max) in sorted_scale_items:
-            # Check for overlap: (min1 <= max2) and (max1 >= min2)
             if (scale_min <= max_search_arcmin) and (scale_max >= min_search_arcmin):
                 overlapping_scales.append(scale_num)
                 
         if not overlapping_scales:
-            self.logger.warning(f"No matching index scales found for FOV {fov_deg} deg.")
-            return set() # Return empty set
+            self.logger.warning(f"No matching index scales found for FOV {fov_deg:.3f} deg.")
+            return set()
 
-        # If 3 or fewer scales match, use all of them
+        # Select 3 middle scales (or all if <=3)
         if len(overlapping_scales) <= 3:
-            self.logger.info(f"Found {len(overlapping_scales)} overlapping scales. Using all: {overlapping_scales}")
+            # self.logger.info(f"Found {len(overlapping_scales)} overlapping scales. Using all: {overlapping_scales}")
             return set(overlapping_scales)
-        
-        # If more than 3, find the middle three
         else:
             mid_index = len(overlapping_scales) // 2
             middle_three_scales = overlapping_scales[mid_index - 1 : mid_index + 2]
-            self.logger.info(f"Found {len(overlapping_scales)} overlapping scales ({overlapping_scales}). Selecting middle 3: {middle_three_scales}")
+            # self.logger.info(f"Found {len(overlapping_scales)} overlapping scales ({overlapping_scales}). Selecting middle 3: {middle_three_scales}")
             return set(middle_three_scales)
-
+        
 
     def update_wcs(self, 
                    fpath_fits, 
-                   outdir, 
-                   pixel_scale_arcsec: float,
-                   fov_deg: float,
-                   key_ra: str = "RA", 
-                   key_dec: str = "DEC", 
-                   search_radius_deg: float = 5.0,
+                   fpath_out,
+                   fov_deg: float = 1.0,
+                   pixel_scale_arcsec: float = None,
+                   key_ra: str = None, 
+                   key_dec: str = None, 
+                   search_radius_deg: float = 2.0,
                    cache_directory = "astrometry_cache", 
-                   return_fpath=True):
+                   return_fpath: bool = True):
         """
         Solve for WCS and update FITS header.
         Reads .fits and writes to .wcs.fits.
@@ -135,9 +124,11 @@ class FitsLv1:
         outdir = Path(outdir)
         outdir.mkdir(parents=True, exist_ok=True)
 
-        # Read input file
+        # Read science image
         try:
             sci = CCDData.read(fpath_fits) 
+        except ValueError:
+            sci = CCDData.read(fpath_fits, unit='adu')
         except FileNotFoundError:
             self.logger.error(f"File not found: {fpath_fits}")
             return
@@ -156,62 +147,106 @@ class FitsLv1:
             self.logger.error(f"Source detection failed for {fpath_fits.name}: {e}")
             return
         
-        # 1. Dynamically select index series and scale map based on FOV
-        if fov_deg > 1.0:
-            self.logger.info(f"FOV {fov_deg} deg > 1 deg, using 4100-series index files.")
-            index_func = astrometry.series_4100
-            scale_map = SCALE_MAP_4100
-        else:
-            self.logger.info(f"FOV {fov_deg} deg <= 1 deg, using 5200-series index files.")
-            index_func = astrometry.series_5200
-            scale_map = SCALE_MAP_5200
-
-        dynamic_scales = self._get_dynamic_scales(fov_deg, scale_map)
+        # Determine astrometry scales
+        dynamic_scales = self._get_dynamic_scales(fov_deg)
         if not dynamic_scales:
             self.logger.error(f"Could not determine scales for FOV {fov_deg} deg. Aborting WCS solve.")
             return
 
-        # 2. Dynamically set pixel scale hint
-        # Use a 5% tolerance band around the known pixel scale
-        lower_px_scale = pixel_scale_arcsec * 0.95
-        upper_px_scale = pixel_scale_arcsec * 1.05
-        
-        # self.logger.info(f"Using dynamic scales {dynamic_scales} for {index_func.__name__}") # This is now logged in the helper
-        self.logger.info(f"Using SizeHint (pixel scale): {lower_px_scale:.2f}-{upper_px_scale:.2f} arcsec/pix")
+        # Build Index File List (Split between 5200 and 4100)
 
-        # 3. Get position hint from generalized keys
+        # Series 5200 covers scales 0-6
+        # Series 4100 covers scales 7-19
+        scales_5200 = {s for s in dynamic_scales if 0 <= s <= 6}
+        scales_4100 = {s for s in dynamic_scales if 7 <= s <= 19}
+        
+        index_files_list = []
+        if scales_5200:
+            try:
+                files = astrometry.series_5200.index_files(
+                    cache_directory=cache_directory, 
+                    scales=scales_5200
+                )
+                index_files_list.extend(files)
+                # self.logger.info(f"Using series_5200 for scales: {scales_5200}")
+            except Exception as e:
+                # self.logger.warning(f"Failed to fetch series_5200 index files: {e}")
+                pass
+
+        if scales_4100:
+            try:
+                # Use series_4100 for larger scales (0.36GB total size, very efficient)
+                files = astrometry.series_4100.index_files(
+                    cache_directory=cache_directory, 
+                    scales=scales_4100
+                )
+                index_files_list.extend(files)
+                # self.logger.info(f"Using series_4100 for scales: {scales_4100}")
+            except AttributeError:
+                # self.logger.warning("astrometry.series_4100 not found. Trying series_4200 (2MASS).")
+                try:
+                    files = astrometry.series_4200.index_files(
+                        cache_directory=cache_directory, 
+                        scales=scales_4100
+                    )
+                    index_files_list.extend(files)
+                    # self.logger.info(f"Using series_4200 for scales: {scales_4100}")
+                except Exception as e:
+                    # self.logger.error(f"Failed to fetch series_4200 index files: {e}")
+                    pass
+            except Exception as e:
+                # self.logger.warning(f"Failed to fetch series_4100 index files: {e}")
+                pass
+
+        if not index_files_list:
+            self.logger.error("No index files could be selected/downloaded. Aborting.")
+            return
+
+        # Dynamically set pixel scale hint (if given)
+        if pixel_scale_arcsec:
+            # Use a 10% tolerance band around the known pixel scale
+            size_hint = astrometry.SizeHint(
+                            lower_arcsec_per_pixel=pixel_scale_arcsec * 0.9, 
+                            upper_arcsec_per_pixel=pixel_scale_arcsec * 1.1
+                        )
+            # self.logger.info(f"Using SizeHint (pixel scale): {lower_px_scale:.2f}-{upper_px_scale:.2f} arcsec/pix")
+        else:
+            size_hint = None
+        
+        # Set position hint (if given)            
         try:
-            ra_hint = float(sci.header[key_ra])
-            dec_hint = float(sci.header[key_dec])
-            self.logger.info(f"Using PositionHint: RA={ra_hint}, DEC={dec_hint} (from {key_ra}, {key_dec})")
+            ra_val = sci.header[key_ra]
+            if isinstance(ra_val, str):
+                ra_hint = Angle(ra_val, unit=u.hour).degree
+            else:
+                ra_hint = Angle(ra_val, unit=u.deg).degree
+
+            dec_val = sci.header[key_dec]
+            dec_hint = Angle(dec_val, unit=u.deg).degree
+            
+            position_hint=astrometry.PositionHint(
+                    ra_deg=ra_hint,
+                    dec_deg=dec_hint,
+                    radius_deg=search_radius_deg
+                )
+            # self.logger.info(f"Using PositionHint: RA={ra_hint:.5f}, DEC={dec_hint:.5f} (from {key_ra}, {key_dec})")
         except KeyError as e:
-            self.logger.error(f"Header key {e} not found (for {key_ra}/{key_dec}). Aborting WCS solve.")
-            return
+            self.logger.warning(f"Header key {e} not found (for {key_ra}/{key_dec}). Skip position hint.")
+            position_hint = None
+            
         except (ValueError, TypeError):
-            self.logger.error(f"Could not convert RA/DEC from header ({key_ra}, {key_dec}) to float.")
-            return
+            # self.logger.warning(f"Could not convert RA/DEC from header ({key_ra}, {key_dec}) to float.")
+            position_hint = None
 
         # Solve WCS
         wcs_solved = False
         try:
-            with astrometry.Solver(
-                index_func.index_files(
-                    cache_directory=cache_directory, 
-                    scales=dynamic_scales  
-                ),
-                log_level=logging.WARNING
-            ) as solver:
+            with astrometry.Solver(index_files_list) as solver:
+                
                 sol = solver.solve(
                     stars=coords,
-                    size_hint=astrometry.SizeHint(
-                        lower_arcsec_per_pixel=lower_px_scale, 
-                        upper_arcsec_per_pixel=upper_px_scale
-                    ),
-                    position_hint=astrometry.PositionHint(
-                        ra_deg=ra_hint,
-                        dec_deg=dec_hint,
-                        radius_deg=search_radius_deg
-                    ),
+                    size_hint=size_hint,
+                    position_hint=position_hint,
                     solution_parameters=astrometry.SolutionParameters(
                         logodds_callback=lambda l: astrometry.Action.STOP if len(l)>=10 else astrometry.Action.CONTINUE,
                         sip_order=3
@@ -225,42 +260,38 @@ class FitsLv1:
                     sci.header.extend(hdr, update=True)
                     sci.header['PIXSCALE'] = (best.scale_arcsec_per_pixel, "arcsec/pixel")
                     sci.header['HISTORY'] = f"({datetime.now().isoformat()}) WCS updated. (solopy.Lv1.update_wcs)"
-                    wcs_solved = True
+                    # wcs_solved = True
                 else:
                     self.logger.warning(f"No WCS solution found for {fpath_fits.name}.")
         except Exception as e:
-             self.logger.warning(f"Astrometry.net solver failed for {fpath_fits.name}: {e}")
-
-        # compute center coords (only if wcs solved)
-        if wcs_solved:
-            try:
-                cen = (sci.header['NAXIS1']//2, sci.header['NAXIS2']//2)
-                sky = sci.wcs.pixel_to_world(*cen)
-                loc = EarthLocation(lat=sci.header['LAT']*u.deg, lon=sci.header['LON']*u.deg, height=sci.header['ELEV']*u.km)
-                altaz = sky.transform_to(AltAz(obstime=Time(sci.header['JD'], format='jd'), location=loc))
-                sci.header['RACEN'] = (sky.ra.value, "deg center RA")
-                sci.header['DECCEN'] = (sky.dec.value, "deg center DEC")
-                sci.header['ALTCEN'] = (altaz.alt.value, "deg center Alt")
-                sci.header['AZCEN'] = (altaz.az.value, "deg center Az")
-            except Exception as e:
-                self.logger.warning(f"Center coordinate calculation failed for {fpath_fits.name}: {e}")
-        else:
-            self.logger.warning(f"Skipping center coord calculation for {fpath_fits.name} (no WCS).")
+            self.logger.warning(f"Astrometry.net solver failed for {fpath_fits.name}: {e}")
+            
+        #     try:
+        #         cen = (sci.header['NAXIS1']//2, sci.header['NAXIS2']//2)
+        #         sky = sci.wcs.pixel_to_world(*cen)
+        #         loc = EarthLocation(lat=sci.header['LAT']*u.deg, lon=sci.header['LON']*u.deg, height=sci.header['ELEV']*u.km)
+        #         altaz = sky.transform_to(AltAz(obstime=Time(sci.header['JD'], format='jd'), location=loc))
+        #         sci.header['RACEN'] = (sky.ra.value, "deg center RA")
+        #         sci.header['DECCEN'] = (sky.dec.value, "deg center DEC")
+        #         sci.header['ALTCEN'] = (altaz.alt.value, "deg center Alt")
+        #         sci.header['AZCEN'] = (altaz.az.value, "deg center Az")
+        #     except Exception as e:
+        #         self.logger.warning(f"Center coordinate calculation failed for {fpath_fits.name}: {e}")
+        # else:
+        #     self.logger.warning(f"Skipping center coord calculation for {fpath_fits.name} (no WCS).")
 
         # "image.fits" -> "image.wcs.fits"
-        out_name = f"{fpath_fits.stem}.wcs.fits"
-        outpath = outdir / out_name
 
         new_hdu = fits.PrimaryHDU(data=sci.data, header=sci.header)
         try:
-            new_hdu.writeto(outpath, overwrite=True)
-            self.logger.info(f"WCS updated: {outpath.name}")
+            new_hdu.writeto(fpath_out, overwrite=True)
+            self.logger.info(f"WCS updated: {fpath_out.name}")
         except Exception as e:
-            self.logger.error(f"Failed to write {outpath}: {e}")
+            self.logger.error(f"Failed to write {fpath_out}: {e}")
             return
 
         if return_fpath:
-            return outpath
+            return fpath_out
 
     def preprocessing(self, fpath_fits, outdir, masterdir, return_fpath=True):
         """
