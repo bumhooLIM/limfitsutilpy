@@ -234,7 +234,7 @@ class FitsLv1:
                 )
                 if sol.has_match():
                     best = sol.best_match()
-                    self.logger.info(f"WCS match: RA={best.center_ra_deg:.5f}$\degree$, DEC={best.center_dec_deg:.5f}$\degree$, scale={best.scale_arcsec_per_pixel:.3f} \"/pixel" )
+                    self.logger.info(f"WCS match: RA={best.center_ra_deg:.5f} deg, DEC={best.center_dec_deg:.5f} deg, scale={best.scale_arcsec_per_pixel:.3f} \"/pixel" )
                     sci.wcs = best.astropy_wcs()
                     hdr = best.astropy_wcs().to_header(relax=True)
                     sci.header.extend(hdr, update=True)
@@ -269,6 +269,8 @@ class FitsLv1:
         fpath_out.parent.mkdir(parents=True, exist_ok=True)
         masterdir = Path(masterdir)
         
+        self.logger.info(f"Starting preprocessing. FILENAME={fpath_fits.name}, MASTERDIR={masterdir}.")
+        
         try:
             sci = CCDData.read(fpath_fits)
         except ValueError:
@@ -277,77 +279,71 @@ class FitsLv1:
             self.logger.error(f"File not found: {fpath_fits}")
             return
         except Exception as e:
-            self.logger.error(f"Error reading FITS {fpath_fits}: {e}")
+            self.logger.error(f"Error reading science frame: {e}")
             return
         
         try:
-            mbias = self._select_master(masterdir, 'BIAS', sci.header['JD'])
-            mdark = self._select_master(masterdir, 'DARK', sci.header['JD'], sci.header['EXPTIME'])
-            mflat = self._select_master(masterdir, 'FLAT', sci.header['JD'])
+            mbias, fname_mbias = self._select_master(masterdir, 'BIAS', sci.header['JD'], return_fname=True)
+            mdark, fname_mdark = self._select_master(masterdir, 'DARK', sci.header['JD'], sci.header['EXPTIME'], return_fname=True)
+            mflat, fname_mflat = self._select_master(masterdir, 'FLAT', sci.header['JD'], return_fname=True)
         except Exception as e:
-            self.logger.error(f"Failed to load master frames for {fpath_fits.name}: {e}")
+            self.logger.error(f"Failed to load master frames: {e}")
             return
         
         try:
-            mask = self._select_master(masterdir, 'MASK', sci.header['JD'])
+            mask, fname_mask = self._select_master(masterdir, 'MASK', sci.header['JD'], return_fname=True)
         except Exception as e:
-            self.logger.warning(f"Failed to load master mask for {fpath_fits.name}: {e}")
-            mask = None
+            self.logger.warning(f"Failed to load master mask. Proceeding without mask.")
+            mask, fname_mask = None, None
         
         try:
             # Bias
             bsci = ccdproc.subtract_bias(sci, mbias)
             bsci.meta['BIASCORR'] = (True, "Bias corrected?")
-            bsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bias subtracted."
-            self.logger.info(f"Bias subtracted for {fpath_fits.name}")
+            bsci.meta['BIASNAME'] = (fname_mbias, "File name of master bias")
+            bsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bias subtracted. ({fname_mbias})"
+            self.logger.info(f"Bias subtracted.")
             
-            # dark
+            # Dark
             bdsci = ccdproc.subtract_dark(bsci, mdark, exposure_time="EXPTIME", exposure_unit=u.second)
             bdsci.meta['DARKCORR'] = (True, "Dark corrected?")
-            bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Dark subtracted."
-            self.logger.info(f"Dark subtracted for {fpath_fits.name}")
+            bdsci.meta['DARKNAME'] = (fname_mdark, "File name of master dark")
+            bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Dark subtracted. ({fname_mdark})"
+            self.logger.info(f"Dark subtracted.")
             
-            # mask (Mask negative values and clip to 0)
+            # Mask (Mask negative values and clip to 0)
             mask_negative = bdsci.data < 0
             if mask is not None:
                 mask = mask_negative | mask.data
+                bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bad pixels masked. ({fname_mask})"
+                bdsci.meta['MASKNAME'] = (fname_mask, "File name of bad pixel mask")
             else:
                 mask = mask_negative
             bdsci.mask = mask
-            bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Bad pixels masked."
             bdsci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Negative values masked."
-            self.logger.info(f"Bad pixels masked for {fpath_fits.name}")
+            self.logger.info(f"Bad pixels masked.")
             
-            # flat
+            # Flat
             psci = ccdproc.flat_correct(bdsci, mflat)
             psci.meta['FLATCORR'] = (True, "Flat corrected?")
-            psci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Flat corrected."
-            self.logger.info(f"Flat corrected for {fpath_fits.name}")
-        
-        except Exception as e:
-            self.logger.error(f"CCD processing failed for {fpath_fits.name}: {e}")
-            return
-
-        # 3. Write the processed file (Multi-Extension FITS)
-        # if 'RACEN' not in psci.header or 'DECCEN' not in psci.header:
-        #     self.logger.warning(f"RACEN/DECCEN not in header for {fpath_fits.name}. Using original name.")
-        #     # 'image.wcs.fits' -> 'image.wcs.proc.fits'
-        #     outname = f"{fpath_fits.stem}.proc.fits"
+            psci.meta['FLATNAME'] = (fname_mflat, "File name of master flat")
+            psci.meta['HISTORY'] = f"({datetime.now().isoformat()}) Flat corrected. ({fname_mflat})"
+            self.logger.info(f"Flat corrected.")
             
-        # else:
-        #     rac = int(round(psci.header['RACEN']))
-        #     dec = int(round(psci.header['DECCEN']))
-        #     pm = 'p' if dec >= 0 else 'n'
-        #     exp = int(round(psci.header['EXPTIME']))
-        #     obst = Time(psci.header['DATE-OBS']).strftime("%Y%m%d%H%M%S")
-        #     # 파일명 .fits로 수정
-        #     outname = f"kl4040.sci.{rac:03d}.{pm}{abs(dec):02d}.{exp:03d}.{obst}.fits"        
-        # outpath = outdir / outname
+            # Metadata updates
+            if 'FILENAME' in psci.meta:
+                psci.meta['HISTORY'] = f"File name updated. ({psci.meta['FILENAME']} -> {fpath_out.stem})"
+            psci.meta['FILENAME'] = fpath_out.stem
+            
+        except Exception as e:
+            self.logger.error(f"CCD processing failed: {e}")
+            return
         
-        # 1. Primary HDU (Science Data) 생성
+        # Write Multi-Extension FITS
+        # 1. Primary HDU
         primary_hdu = fits.PrimaryHDU(data=psci.data, header=psci.header)
         
-        # 2. Mask HDU (ImageHDU) 생성
+        # 2. Mask HDU (if available)
         if psci.mask is not None:
             mask_data = psci.mask.astype(np.uint8)
             mask_hdu = fits.ImageHDU(data=mask_data, name='MASK')
@@ -359,13 +355,13 @@ class FitsLv1:
             hdul_out.writeto(fpath_out, overwrite=True)
             self.logger.info(f"Preprocessing complete: {fpath_out.name}")
         except Exception as e:
-            self.logger.error(f"Failed to write MEF {fpath_out}: {e}")
+            self.logger.error(f"Failed to write FITS ({fpath_out.name}): {e}")
             return
-            
+        
         if return_fpath:
             return fpath_out
 
-    def _select_master(self, masterdir, imagetyp, jd_target, exptime=None):
+    def _select_master(self, masterdir, imagetyp, jd_target, exptime=None, return_fname=False):
         """
         Helper to select the closest master frame by JD (and exposure time if given).
         Assumes master frames are UNCOMPRESSED .fits files.
@@ -383,13 +379,13 @@ class FitsLv1:
         elif 'JD' in df.columns:
             jd_col = 'JD'
         else:
-            raise KeyError(f"Cannot find 'jd' or 'JD' column in ImageFileCollection summary for {imagetyp}")
+            raise KeyError(f"Cannot find 'JD' columns for master {imagetyp} frames.")
 
         df[jd_col] = df[jd_col].astype(float)
         df['diff'] = (df[jd_col] - jd_target).abs()
         
         if exptime is not None:
-            # Find 'exptime' or 'EXPTIME' column
+            # Find exptime column
             exp_col = None
             if 'exptime' in df.columns:
                 exp_col = 'exptime'
@@ -399,15 +395,15 @@ class FitsLv1:
             if exp_col:
                 df[exp_col] = df[exp_col].astype(float)
                 # Select the master dark frame with the closest exposure time
-                available_exptimes = df[exp_col].unique()
-                closest_exptime = min(available_exptimes, key=lambda x: abs(x - float(exptime)))
-                self.logger.info(f"Requested exptime {exptime}, found closest master dark {closest_exptime}")
-                df = df[df[exp_col] == closest_exptime].copy() # .copy() to avoid SettingWithCopyWarning
+                exptime_unique = df[exp_col].unique()
+                exptime_closest = min(exptime_unique, key=lambda x: abs(x - float(exptime)))
+                self.logger.info(f"Requested exptime={exptime:.1f} sec, found closest master frame exptime={exptime_closest:.1f} sec.")
+                df = df[df[exp_col] == exptime_closest].copy() # .copy() to avoid SettingWithCopyWarning
             else:
-                self.logger.warning(f"Cannot find 'exptime' or 'EXPTIME' for {imagetyp}, proceeding without exptime filter.")
+                self.logger.warning(f"Cannot find 'exptime' columns for master {imagetyp}, proceeding without exptime filter.")
 
         if df.empty:
-             raise FileNotFoundError(f"No matching master {imagetyp} found for JD={jd_target}, EXPTIME={exptime}")
+            raise FileNotFoundError(f"No matching master {imagetyp} frame found for JD={jd_target:.1f}, EXPTIME={exptime:.1f} sec.")
 
         idx = df['diff'].idxmin()
         selected_file = Path(coll.files_filtered(include_path=True)[idx])
@@ -421,4 +417,7 @@ class FitsLv1:
         except ValueError:
             master_frame = ccdproc.CCDData.read(selected_file, unit='adu')
 
-        return master_frame
+        if return_fname:
+            return master_frame, selected_file.name
+        else:
+            return master_frame
